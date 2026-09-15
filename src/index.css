@@ -1,0 +1,15 @@
+@import "tailwindcss";
+
+@font-face {
+  font-family: 'system-fallback';
+}
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  overscroll-behavior: none;
+}
+
+body {
+  -webkit-tap-highlight-color: transparent;
+}
