@@ -613,8 +613,7 @@ function Login({ data, onLogin }) {
         <button onClick={tryLogin} className="rounded-2xl py-4 font-semibold active:scale-95 transition" style={{ background: BRASS, color: INK }}>Go</button>
       </div>
 
-      <p className="text-xs mt-8" style={{ color: "#7A806E" }}>Demo owner PIN 0000 · barbers 1111 / 2222 / 3333</p>
-    </div>
+          </div>
   );
 }
 
@@ -1791,10 +1790,11 @@ function PartnersView({ data, persist, logAudit, onBack, say }) {
 function SettingsView({ data, persist, onBack, say }) {
   const [s, setS] = useState(data.settings);
   const [partners, setPartners] = useState(data.partners);
+  const [ownerPin, setOwnerPin] = useState(data.ownerPin);
 
   const save = async () => {
     const totalOwnership = partners.reduce((sum, p) => sum + Number(p.ownership), 0);
-    const next = { ...data, settings: s, partners };
+    const next = { ...data, settings: s, partners, ownerPin: ownerPin.trim() || data.ownerPin };
     await persist(next);
     say(totalOwnership === 100 ? "Settings saved" : "Settings saved (ownership does not total 100%)");
   };
@@ -1803,6 +1803,10 @@ function SettingsView({ data, persist, onBack, say }) {
     <div className="px-4 pt-4">
       <Header title="Settings" onBack={onBack} />
       <div className="mt-4 space-y-4">
+        <Field label="Owner PIN">
+          <input className={inputCls} style={inputStyle} value={ownerPin} onChange={(e) => setOwnerPin(e.target.value)} maxLength={6} />
+        </Field>
+        <p className="text-xs -mt-2" style={{ color: INK, opacity: 0.5 }}>Only you (and any other partner using this same PIN) should know this. It logs in as owner with full access to every screen.</p>
         <Field label="Shop name"><input className={inputCls} style={inputStyle} value={s.shopName} onChange={(e) => setS({ ...s, shopName: e.target.value })} /></Field>
         <Field label="Address"><input className={inputCls} style={inputStyle} value={s.address} onChange={(e) => setS({ ...s, address: e.target.value })} /></Field>
         <Field label="Phone"><input className={inputCls} style={inputStyle} value={s.phone} onChange={(e) => setS({ ...s, phone: e.target.value })} /></Field>
