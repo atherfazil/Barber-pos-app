@@ -85,11 +85,12 @@ function seedData() {
     expenseCategories: [
       "Rent", "Electricity", "Water", "Internet", "Cleaning", "Laundry", "Supplies",
       "Hair Products", "Towels", "Maintenance", "Equipment", "Marketing", "Bank Charges",
-      "Government Fees", "Licenses", "Transportation", "Petty Cash", "Other"
+      "Government Fees", "Licenses", "Transportation", "Other"
     ],
     sales: [],
     expenses: [],
     bankTransactions: [],
+    tillTransfers: [],
     dailyClosings: [],
     partnerLedger: [], // {id, partnerId, type: contribution|withdrawal|distribution, amount, date, note}
     auditLog: [],
@@ -314,7 +315,7 @@ function salesForDate(data, date) {
   return data.sales.filter((s) => s.date === date && s.status !== "void");
 }
 function expensesForDate(data, date) {
-  return data.expenses.filter((e) => e.date === date);
+  return data.expenses.filter((e) => e.date === date && e.status !== "void");
 }
 
 function cashSummaryForDate(data, date) {
@@ -336,11 +337,38 @@ function openingCashForDate(data, date) {
   return data.settings.openingCashDefault;
 }
 
+// Cash physically leaving the sales till today, other than register
+// expenses: bank deposits and transfers into petty cash. Both reduce
+// what should be sitting in the drawer.
+function tillTransfersForDate(data, date) {
+  return (data.tillTransfers || []).filter((t) => t.date === date && !t.voided);
+}
+function bankDepositsForDate(data, date) {
+  return data.bankTransactions.filter((t) => t.date === date && t.type === "deposit" && !t.voided);
+}
+function expectedCashForDate(data, date) {
+  const cs = cashSummaryForDate(data, date);
+  const opening = openingCashForDate(data, date);
+  const transfersOut = tillTransfersForDate(data, date).reduce((sum, t) => sum + t.amount, 0);
+  const depositsOut = bankDepositsForDate(data, date).reduce((sum, t) => sum + t.amount, 0);
+  return opening + cs.cashSales - cs.cashExpenses - transfersOut - depositsOut;
+}
+
+// Petty cash is its own till: a starting float, plus manual top-ups and
+// transfers in from the sales till, minus petty expenses. It never
+// touches the sales till's own cash math above.
+function pettyCashBalance(data) {
+  const adjustments = data.pettyCash.adjustments.filter((a) => !a.voided);
+  const fromAdjustments = adjustments.reduce((sum, a) => sum + (a.type === "top-up" ? a.amount : -a.amount), 0);
+  const fromTillTransfers = (data.tillTransfers || []).filter((t) => !t.voided).reduce((sum, t) => sum + t.amount, 0);
+  return data.pettyCash.opening + fromAdjustments + fromTillTransfers;
+}
+
 function monthKey(date) { return date.slice(0, 7); }
 
 function pnlForMonth(data, ym) {
   const sales = data.sales.filter((s) => s.date.startsWith(ym) && s.status !== "void");
-  const exps = data.expenses.filter((e) => e.date.startsWith(ym));
+  const exps = data.expenses.filter((e) => e.date.startsWith(ym) && e.status !== "void");
   const grossRevenue = sales.reduce((sum, s) => sum + s.gross, 0);
   const discounts = sales.reduce((sum, s) => sum + (s.discount || 0), 0);
   const netRevenue = sales.reduce((sum, s) => sum + s.net, 0);
@@ -479,7 +507,26 @@ export default function App() {
             )}
 
             {view === "reports" && session.role === "owner" && (
-              <Reports data={data} onBack={goHome} />
+              <Reports data={data} onBack={goHome} session={session} say={say}
+                onVoidSale={async (saleId, reason) => {
+                  const next = {
+                    ...data,
+                    sales: data.sales.map((s) => s.id === saleId ? { ...s, status: "void", voidReason: reason, voidedBy: session.name, voidedAt: new Date().toISOString() } : s),
+                    auditLog: logAudit(data.auditLog, { action: "sale_voided", details: `${saleId} — ${reason}` }),
+                  };
+                  await persist(next);
+                  say("Sale deleted");
+                }}
+                onVoidExpense={async (expenseId, reason) => {
+                  const next = {
+                    ...data,
+                    expenses: data.expenses.map((e) => e.id === expenseId ? { ...e, status: "void", voidReason: reason, voidedBy: session.name, voidedAt: new Date().toISOString() } : e),
+                    auditLog: logAudit(data.auditLog, { action: "expense_voided", details: `${expenseId} — ${reason}` }),
+                  };
+                  await persist(next);
+                  say("Expense deleted");
+                }}
+              />
             )}
 
             {view === "partners" && session.role === "owner" && (
@@ -488,6 +535,10 @@ export default function App() {
 
             {view === "settings" && session.role === "owner" && (
               <SettingsView data={data} persist={persist} onBack={goHome} say={say} />
+            )}
+
+            {view === "auditlog" && session.role === "owner" && (
+              <AuditLogView data={data} onBack={goHome} />
             )}
           </>
         )}
@@ -591,7 +642,7 @@ function Dashboard({ data, onNav }) {
   const ym = today.slice(0, 7);
   const pnl = pnlForMonth(data, ym);
   const opening = openingCashForDate(data, today);
-  const expectedCash = opening + cs.cashSales - cs.cashExpenses;
+  const expectedCash = expectedCashForDate(data, today);
   const locked = isDayLocked(data, today);
   const lowIncomplete = data.dailyClosings.length === 0;
 
@@ -615,6 +666,15 @@ function Dashboard({ data, onNav }) {
           <div className="flex items-center justify-between">
             <span style={{ fontFamily: FONT_DISPLAY, color: INK }} className="font-semibold">Partner Accounts</span>
             <TrendingUp size={18} color={BRASS} />
+          </div>
+        </Card>
+      </button>
+
+      <button onClick={() => onNav("auditlog")} className="w-full mt-3">
+        <Card>
+          <div className="flex items-center justify-between">
+            <span style={{ fontFamily: FONT_DISPLAY, color: INK }} className="font-semibold">Audit Log</span>
+            <ShieldCheck size={18} color={BRASS} />
           </div>
         </Card>
       </button>
@@ -941,31 +1001,49 @@ function NewExpense({ data, session, onSave, onCancel }) {
    CASH / PETTY CASH
 --------------------------------------------------------------------- */
 function CashPettyCash({ data, session, persist, logAudit, onBack, say }) {
-  const [tab, setTab] = useState("register"); // register | petty | deposit
+  const [tab, setTab] = useState("register"); // register | petty | transfer | deposit
+  const [deletingAdj, setDeletingAdj] = useState(null);
+  const [deleteReason, setDeleteReason] = useState("");
   const today = todayStr();
   const cs = cashSummaryForDate(data, today);
   const opening = openingCashForDate(data, today);
-  const expected = opening + cs.cashSales - cs.cashExpenses;
+  const expected = expectedCashForDate(data, today);
+  const transfersToday = tillTransfersForDate(data, today).reduce((sum, t) => sum + t.amount, 0);
+  const depositsToday = bankDepositsForDate(data, today).reduce((sum, t) => sum + t.amount, 0);
 
-  const pettyBalance = data.pettyCash.opening + data.pettyCash.adjustments.reduce((sum, a) =>
-    sum + (a.type === "top-up" ? a.amount : -a.amount), 0);
+  const pettyBalance = pettyCashBalance(data);
+  const isOwner = session.role === "owner";
 
   const [pettyAmt, setPettyAmt] = useState("");
   const [pettyNote, setPettyNote] = useState("");
   const [pettyType, setPettyType] = useState("expense");
 
+  const [transferAmt, setTransferAmt] = useState("");
   const [depositAmt, setDepositAmt] = useState("");
 
   const addPetty = async () => {
     if (!Number(pettyAmt)) return;
     const next = {
       ...data,
-      pettyCash: { ...data.pettyCash, adjustments: [...data.pettyCash.adjustments, { id: uid("PC"), date: today, type: pettyType, amount: Number(pettyAmt), note: pettyNote }] },
+      pettyCash: { ...data.pettyCash, adjustments: [...data.pettyCash.adjustments, { id: uid("PC"), date: today, type: pettyType, amount: Number(pettyAmt), note: pettyNote, enteredBy: session.name }] },
       auditLog: logAudit(data.auditLog, { action: "petty_cash", details: `${pettyType} ${money(pettyAmt, data.settings.currency)}` }),
     };
     await persist(next);
     say("Petty cash updated");
     setPettyAmt(""); setPettyNote("");
+  };
+
+  const doTransfer = async () => {
+    const amt = Number(transferAmt);
+    if (!amt || amt > expected) return;
+    const next = {
+      ...data,
+      tillTransfers: [...(data.tillTransfers || []), { id: uid("TXF"), date: today, amount: amt, note: "Sales till → Petty cash", transferredBy: session.name }],
+      auditLog: logAudit(data.auditLog, { action: "till_transfer", details: `${money(amt, data.settings.currency)} moved to petty cash` }),
+    };
+    await persist(next);
+    say("Cash moved to petty cash");
+    setTransferAmt("");
   };
 
   const doDeposit = async () => {
@@ -980,36 +1058,60 @@ function CashPettyCash({ data, session, persist, logAudit, onBack, say }) {
     setDepositAmt("");
   };
 
+  const confirmDeleteAdjustment = async () => {
+    const next = {
+      ...data,
+      pettyCash: {
+        ...data.pettyCash,
+        adjustments: data.pettyCash.adjustments.map((a) => a.id === deletingAdj.id
+          ? { ...a, voided: true, voidReason: deleteReason.trim() || "No reason given", voidedBy: session.name, voidedAt: new Date().toISOString() }
+          : a),
+      },
+      auditLog: logAudit(data.auditLog, { action: "petty_cash_deleted", details: `${deletingAdj.id} — ${deleteReason.trim() || "No reason given"}` }),
+    };
+    await persist(next);
+    say("Entry deleted");
+    setDeletingAdj(null);
+    setDeleteReason("");
+  };
+
   const bankBalance = data.bankTransactions.reduce((sum, t) => sum + (t.type === "deposit" ? t.amount : -t.amount), 0)
     + data.sales.filter((s) => s.status !== "void").reduce((sum, s) => sum + (s.payment.card || 0), 0);
+
+  const recentPettyEntries = data.pettyCash.adjustments.slice().reverse().slice(0, 25);
 
   return (
     <div className="px-4 pt-4">
       <Header title="Cash & Petty Cash" onBack={onBack} />
-      <div className="flex gap-2 mt-4 mb-4">
-        {[{ k: "register", l: "Register" }, { k: "petty", l: "Petty Cash" }, { k: "deposit", l: "Bank Deposit" }].map((t) => (
-          <button key={t.k} onClick={() => setTab(t.k)} className="flex-1 rounded-xl py-2 text-sm font-semibold"
+      <div className="flex gap-2 mt-4 mb-4 flex-wrap">
+        {[{ k: "register", l: "Sales Till" }, { k: "petty", l: "Petty Cash" }, { k: "transfer", l: "Move to Petty" }, { k: "deposit", l: "Bank Deposit" }].map((t) => (
+          <button key={t.k} onClick={() => setTab(t.k)} className="rounded-xl px-3 py-2 text-sm font-semibold"
             style={{ background: tab === t.k ? INK : "#EFE9DA", color: tab === t.k ? PAPER : INK }}>{t.l}</button>
         ))}
       </div>
 
       {tab === "register" && (
         <div className="space-y-3">
+          <div className="text-xs uppercase tracking-wide" style={{ color: INK, opacity: 0.5 }}>Sales till (today)</div>
           <Card>
-            <Row label="Opening cash (today)" value={money(opening, data.settings.currency)} />
+            <Row label="Opening cash" value={money(opening, data.settings.currency)} />
             <Row label="+ Cash sales" value={money(cs.cashSales, data.settings.currency)} />
             <Row label="- Cash expenses" value={money(cs.cashExpenses, data.settings.currency)} />
+            <Row label="- Moved to petty cash" value={money(transfersToday, data.settings.currency)} />
+            <Row label="- Deposited to bank" value={money(depositsToday, data.settings.currency)} />
             <div className="h-px my-2" style={{ background: "#EAE3D3" }} />
             <Row label="Expected cash in drawer" value={money(expected, data.settings.currency)} bold />
           </Card>
           <Card>
             <Row label="Bank / card balance (est.)" value={money(bankBalance, data.settings.currency)} bold />
           </Card>
+          <p className="text-xs" style={{ color: INK, opacity: 0.5 }}>This is the sales register only. Petty cash is a separate float, see the Petty Cash tab.</p>
         </div>
       )}
 
       {tab === "petty" && (
         <div className="space-y-4">
+          <div className="text-xs uppercase tracking-wide" style={{ color: INK, opacity: 0.5 }}>Petty cash till</div>
           <Card>
             <Row label="Petty cash balance" value={money(pettyBalance, data.settings.currency)} bold />
           </Card>
@@ -1026,6 +1128,43 @@ function CashPettyCash({ data, session, persist, logAudit, onBack, say }) {
             <input className={inputCls} style={inputStyle} value={pettyNote} onChange={(e) => setPettyNote(e.target.value)} />
           </Field>
           <button onClick={addPetty} className="w-full rounded-2xl py-3.5 font-bold" style={{ background: BRASS, color: INK, fontFamily: FONT_DISPLAY }}>SAVE</button>
+
+          <div className="text-xs uppercase tracking-wide mt-2" style={{ color: INK, opacity: 0.5 }}>Recent petty cash entries</div>
+          {recentPettyEntries.map((a) => (
+            <Card key={a.id}>
+              <div className="flex justify-between items-start gap-2">
+                <div className={a.voided ? "opacity-40" : ""}>
+                  <div className="text-sm font-semibold" style={{ color: INK }}>
+                    {a.type === "top-up" ? "Top Up" : "Petty Expense"} · {money(a.amount, data.settings.currency)}
+                    {a.voided && <span className="ml-2 text-xs font-normal" style={{ color: RUST }}>DELETED</span>}
+                  </div>
+                  <div className="text-xs" style={{ color: INK, opacity: 0.6 }}>{a.date}{a.note ? ` · ${a.note}` : ""}</div>
+                  {a.voided && a.voidReason && <div className="text-xs mt-1" style={{ color: RUST, opacity: 0.8 }}>Reason: {a.voidReason}</div>}
+                </div>
+                {isOwner && !a.voided && (
+                  <button onClick={() => { setDeletingAdj(a); setDeleteReason(""); }}
+                    className="text-xs font-semibold px-2.5 py-1.5 rounded-lg shrink-0" style={{ background: "#F6E4DC", color: RUST }}>
+                    Delete
+                  </button>
+                )}
+              </div>
+            </Card>
+          ))}
+        </div>
+      )}
+
+      {tab === "transfer" && (
+        <div className="space-y-4">
+          <p className="text-sm" style={{ color: INK, opacity: 0.7 }}>Moves cash out of the sales till and into the petty cash float. Use this instead of manually topping up petty cash with sales money.</p>
+          <Card><Row label="Cash available in sales till" value={money(expected, data.settings.currency)} bold /></Card>
+          <Field label="Amount to move">
+            <input type="number" inputMode="decimal" className={inputCls} style={inputStyle} value={transferAmt} onChange={(e) => setTransferAmt(e.target.value)} />
+          </Field>
+          {Number(transferAmt) > expected && <p className="text-sm" style={{ color: RUST }}>Amount exceeds expected cash in the sales till.</p>}
+          <button onClick={doTransfer} disabled={!Number(transferAmt) || Number(transferAmt) > expected}
+            className="w-full rounded-2xl py-3.5 font-bold disabled:opacity-40" style={{ background: BRASS, color: INK, fontFamily: FONT_DISPLAY }}>
+            MOVE TO PETTY CASH
+          </button>
         </div>
       )}
 
@@ -1037,6 +1176,22 @@ function CashPettyCash({ data, session, persist, logAudit, onBack, say }) {
           </Field>
           {Number(depositAmt) > expected && <p className="text-sm" style={{ color: RUST }}>Amount exceeds expected cash in the drawer.</p>}
           <button onClick={doDeposit} className="w-full rounded-2xl py-3.5 font-bold" style={{ background: SAGE, color: PAPER, fontFamily: FONT_DISPLAY }}>RECORD DEPOSIT</button>
+        </div>
+      )}
+
+      {deletingAdj && (
+        <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(32,36,31,0.5)" }} onClick={() => setDeletingAdj(null)}>
+          <div className="w-full max-w-md rounded-t-3xl p-5 pb-8" style={{ background: PAPER }} onClick={(e) => e.stopPropagation()}>
+            <h3 style={{ fontFamily: FONT_DISPLAY, color: INK }} className="text-lg font-bold mb-1">Delete this entry?</h3>
+            <p className="text-sm mb-4" style={{ color: INK, opacity: 0.65 }}>It stays visible marked as deleted, with a reason attached, and no longer counts toward the petty cash balance.</p>
+            <Field label="Reason (optional)">
+              <input className={inputCls} style={inputStyle} value={deleteReason} onChange={(e) => setDeleteReason(e.target.value)} placeholder="e.g. entered by mistake" autoFocus />
+            </Field>
+            <div className="grid grid-cols-2 gap-3 mt-2">
+              <button onClick={() => setDeletingAdj(null)} className="rounded-2xl py-3.5 font-semibold" style={{ background: "#EFE9DA", color: INK }}>Cancel</button>
+              <button onClick={confirmDeleteAdjustment} className="rounded-2xl py-3.5 font-bold" style={{ background: RUST, color: PAPER }}>Delete</button>
+            </div>
+          </div>
         </div>
       )}
     </div>
@@ -1051,7 +1206,7 @@ function DailyClosing({ data, session, persist, logAudit, onBack, say }) {
   const existing = data.dailyClosings.find((c) => c.date === today);
   const cs = cashSummaryForDate(data, today);
   const opening = openingCashForDate(data, today);
-  const expected = opening + cs.cashSales - cs.cashExpenses;
+  const expected = expectedCashForDate(data, today);
 
   const [actual, setActual] = useState(existing ? String(existing.actualCash) : "");
   const [reason, setReason] = useState(existing?.reason || "");
@@ -1106,6 +1261,8 @@ function DailyClosing({ data, session, persist, logAudit, onBack, say }) {
         </Card>
         <Card>
           <Row label="Opening cash" value={money(opening, data.settings.currency)} />
+          <Row label="Moved to petty cash" value={money(tillTransfersForDate(data, today).reduce((sum, t) => sum + t.amount, 0), data.settings.currency)} />
+          <Row label="Deposited to bank" value={money(bankDepositsForDate(data, today).reduce((sum, t) => sum + t.amount, 0), data.settings.currency)} />
           <Row label="Expected cash" value={money(expected, data.settings.currency)} bold />
         </Card>
 
@@ -1292,20 +1449,38 @@ function ServicesAdmin({ data, persist, logAudit, onBack }) {
 /* ---------------------------------------------------------------------
    REPORTS
 --------------------------------------------------------------------- */
-function Reports({ data, onBack }) {
+function Reports({ data, onBack, onVoidSale, onVoidExpense, say }) {
   const [tab, setTab] = useState("sales");
+  const [voidingId, setVoidingId] = useState(null);
+  const [voidReason, setVoidReason] = useState("");
+  const [voidingExpenseId, setVoidingExpenseId] = useState(null);
+  const [voidExpenseReason, setVoidExpenseReason] = useState("");
   const today = todayStr();
   const ym = today.slice(0, 7);
   const pnl = pnlForMonth(data, ym);
 
   const monthSales = data.sales.filter((s) => s.date.startsWith(ym) && s.status !== "void");
-  const monthExpenses = data.expenses.filter((e) => e.date.startsWith(ym));
+  const monthSalesAll = data.sales.filter((s) => s.date.startsWith(ym));
+  const monthExpenses = data.expenses.filter((e) => e.date.startsWith(ym) && e.status !== "void");
+  const monthExpensesAll = data.expenses.filter((e) => e.date.startsWith(ym));
 
   const salesByBarber = {};
   monthSales.forEach((s) => { salesByBarber[s.barberName] = (salesByBarber[s.barberName] || 0) + s.net; });
 
   const expensesByCat = {};
   monthExpenses.forEach((e) => { expensesByCat[e.category] = (expensesByCat[e.category] || 0) + Number(e.amount); });
+
+  const confirmVoid = () => {
+    onVoidSale(voidingId, voidReason.trim() || "No reason given");
+    setVoidingId(null);
+    setVoidReason("");
+  };
+
+  const confirmVoidExpense = () => {
+    onVoidExpense(voidingExpenseId, voidExpenseReason.trim() || "No reason given");
+    setVoidingExpenseId(null);
+    setVoidExpenseReason("");
+  };
 
   return (
     <div className="px-4 pt-4">
@@ -1325,6 +1500,31 @@ function Reports({ data, onBack }) {
           {Object.entries(salesByBarber).map(([name, amt]) => (
             <Card key={name}><Row label={name} value={money(amt, data.settings.currency)} /></Card>
           ))}
+
+          <div className="text-xs uppercase tracking-wide mt-3 mb-1" style={{ color: INK, opacity: 0.5 }}>All sales this month</div>
+          {monthSalesAll.slice().reverse().map((s) => (
+            <Card key={s.id}>
+              <div className="flex justify-between items-start gap-2">
+                <div className={s.status === "void" ? "opacity-40" : ""}>
+                  <div className="text-sm font-semibold" style={{ color: INK }}>
+                    {s.serviceName} · {s.barberName}
+                    {s.status === "void" && <span className="ml-2 text-xs font-normal" style={{ color: RUST }}>DELETED</span>}
+                  </div>
+                  <div className="text-xs" style={{ color: INK, opacity: 0.6 }}>{s.date} · {money(s.net, data.settings.currency)}</div>
+                  {s.status === "void" && s.voidReason && (
+                    <div className="text-xs mt-1" style={{ color: RUST, opacity: 0.8 }}>Reason: {s.voidReason}</div>
+                  )}
+                </div>
+                {s.status !== "void" && (
+                  <button onClick={() => { setVoidingId(s.id); setVoidReason(""); }}
+                    className="text-xs font-semibold px-2.5 py-1.5 rounded-lg shrink-0" style={{ background: "#F6E4DC", color: RUST }}>
+                    Delete
+                  </button>
+                )}
+              </div>
+            </Card>
+          ))}
+
           {monthSales.some((s) => s.attachment) && (
             <>
               <div className="text-xs uppercase tracking-wide mt-3 mb-1" style={{ color: INK, opacity: 0.5 }}>Sales with attachments</div>
@@ -1348,6 +1548,29 @@ function Reports({ data, onBack }) {
           {Object.entries(expensesByCat).map(([cat, amt]) => (
             <Card key={cat}><Row label={cat} value={money(amt, data.settings.currency)} /></Card>
           ))}
+
+          <div className="text-xs uppercase tracking-wide mt-3 mb-1" style={{ color: INK, opacity: 0.5 }}>All expenses this month</div>
+          {monthExpensesAll.slice().reverse().map((e) => (
+            <Card key={e.id}>
+              <div className="flex justify-between items-start gap-2">
+                <div className={e.status === "void" ? "opacity-40" : ""}>
+                  <div className="text-sm font-semibold" style={{ color: INK }}>
+                    {e.category} · {money(e.amount, data.settings.currency)}
+                    {e.status === "void" && <span className="ml-2 text-xs font-normal" style={{ color: RUST }}>DELETED</span>}
+                  </div>
+                  <div className="text-xs" style={{ color: INK, opacity: 0.6 }}>{e.date}{e.description ? ` · ${e.description}` : ""}</div>
+                  {e.status === "void" && e.voidReason && <div className="text-xs mt-1" style={{ color: RUST, opacity: 0.8 }}>Reason: {e.voidReason}</div>}
+                </div>
+                {e.status !== "void" && (
+                  <button onClick={() => { setVoidingExpenseId(e.id); setVoidExpenseReason(""); }}
+                    className="text-xs font-semibold px-2.5 py-1.5 rounded-lg shrink-0" style={{ background: "#F6E4DC", color: RUST }}>
+                    Delete
+                  </button>
+                )}
+              </div>
+            </Card>
+          ))}
+
           {monthExpenses.some((e) => e.attachment) && (
             <>
               <div className="text-xs uppercase tracking-wide mt-3 mb-1" style={{ color: INK, opacity: 0.5 }}>Expenses with attachments</div>
@@ -1400,6 +1623,42 @@ function Reports({ data, onBack }) {
           <p className="text-xs" style={{ color: INK, opacity: 0.5 }}>Figures are month to date and update automatically as sales and expenses are entered. Use browser print for a PDF copy.</p>
         </div>
       )}
+
+      {voidingId && (
+        <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(32,36,31,0.5)" }} onClick={() => setVoidingId(null)}>
+          <div className="w-full max-w-md rounded-t-3xl p-5 pb-8" style={{ background: PAPER }} onClick={(e) => e.stopPropagation()}>
+            <h3 style={{ fontFamily: FONT_DISPLAY, color: INK }} className="text-lg font-bold mb-1">Delete this sale?</h3>
+            <p className="text-sm mb-4" style={{ color: INK, opacity: 0.65 }}>
+              It stays in your records marked as deleted, with a reason attached, and stops counting toward totals and commission. This can't be undone from here.
+            </p>
+            <Field label="Reason (optional)">
+              <input className={inputCls} style={inputStyle} value={voidReason} onChange={(e) => setVoidReason(e.target.value)} placeholder="e.g. entered by mistake" autoFocus />
+            </Field>
+            <div className="grid grid-cols-2 gap-3 mt-2">
+              <button onClick={() => setVoidingId(null)} className="rounded-2xl py-3.5 font-semibold" style={{ background: "#EFE9DA", color: INK }}>Cancel</button>
+              <button onClick={confirmVoid} className="rounded-2xl py-3.5 font-bold" style={{ background: RUST, color: PAPER }}>Delete Sale</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {voidingExpenseId && (
+        <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(32,36,31,0.5)" }} onClick={() => setVoidingExpenseId(null)}>
+          <div className="w-full max-w-md rounded-t-3xl p-5 pb-8" style={{ background: PAPER }} onClick={(e) => e.stopPropagation()}>
+            <h3 style={{ fontFamily: FONT_DISPLAY, color: INK }} className="text-lg font-bold mb-1">Delete this expense?</h3>
+            <p className="text-sm mb-4" style={{ color: INK, opacity: 0.65 }}>
+              It stays in your records marked as deleted, with a reason attached, and stops counting toward totals. This can't be undone from here.
+            </p>
+            <Field label="Reason (optional)">
+              <input className={inputCls} style={inputStyle} value={voidExpenseReason} onChange={(e) => setVoidExpenseReason(e.target.value)} placeholder="e.g. entered by mistake" autoFocus />
+            </Field>
+            <div className="grid grid-cols-2 gap-3 mt-2">
+              <button onClick={() => setVoidingExpenseId(null)} className="rounded-2xl py-3.5 font-semibold" style={{ background: "#EFE9DA", color: INK }}>Cancel</button>
+              <button onClick={confirmVoidExpense} className="rounded-2xl py-3.5 font-bold" style={{ background: RUST, color: PAPER }}>Delete Expense</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1407,6 +1666,63 @@ function Reports({ data, onBack }) {
 /* ---------------------------------------------------------------------
    PARTNERS
 --------------------------------------------------------------------- */
+/* ---------------------------------------------------------------------
+   AUDIT LOG
+--------------------------------------------------------------------- */
+const AUDIT_ACTION_LABELS = {
+  sale_created: "Sale recorded",
+  sale_voided: "Sale deleted",
+  expense_created: "Expense recorded",
+  expense_voided: "Expense deleted",
+  petty_cash: "Petty cash entry",
+  petty_cash_deleted: "Petty cash entry deleted",
+  till_transfer: "Cash moved to petty cash",
+  bank_deposit: "Bank deposit recorded",
+  day_closed: "Day closed",
+  day_reopened: "Day reopened",
+  barber_saved: "Barber added/updated",
+  service_saved: "Service added/updated",
+  partner_ledger: "Partner account entry",
+};
+
+function AuditLogView({ data, onBack }) {
+  const [filter, setFilter] = useState("all"); // all | deletions
+  const entries = data.auditLog.slice().reverse().filter((e) =>
+    filter === "all" || e.action.includes("voided") || e.action.includes("deleted"));
+
+  return (
+    <div className="px-4 pt-4">
+      <Header title="Audit Log" onBack={onBack} />
+      <div className="flex gap-2 mt-4 mb-4">
+        {[{ k: "all", l: "All Activity" }, { k: "deletions", l: "Deletions Only" }].map((t) => (
+          <button key={t.k} onClick={() => setFilter(t.k)} className="rounded-xl px-3 py-2 text-sm font-semibold"
+            style={{ background: filter === t.k ? INK : "#EFE9DA", color: filter === t.k ? PAPER : INK }}>{t.l}</button>
+        ))}
+      </div>
+      <div className="space-y-2">
+        {entries.length === 0 && <p className="text-sm" style={{ color: INK, opacity: 0.5 }}>Nothing to show yet.</p>}
+        {entries.map((e) => {
+          const isDeletion = e.action.includes("voided") || e.action.includes("deleted");
+          const when = new Date(e.timestamp);
+          return (
+            <Card key={e.id}>
+              <div className="flex justify-between items-start gap-2">
+                <div>
+                  <div className="text-sm font-semibold" style={{ color: isDeletion ? RUST : INK }}>
+                    {AUDIT_ACTION_LABELS[e.action] || e.action}
+                  </div>
+                  <div className="text-xs mt-0.5" style={{ color: INK, opacity: 0.65 }}>{e.details}</div>
+                  <div className="text-xs mt-1" style={{ color: INK, opacity: 0.45 }}>{e.user} · {when.toLocaleDateString()} {when.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</div>
+                </div>
+              </div>
+            </Card>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function PartnersView({ data, persist, logAudit, onBack, say }) {
   const today = todayStr();
   const ym = today.slice(0, 7);
